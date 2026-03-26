@@ -179,7 +179,7 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 	}
 
 	respHeader := DNSHeader{
-		ID:      1234,
+		ID:      header.ID,
 		QR:      1, // Response
 		OPCODE:  header.OPCODE,
 		AA:      0, // Authoritative Answer
