@@ -80,6 +80,43 @@ func ParseDNSHeader(data []byte) (DNSHeader, error) {
 	}, nil
 }
 
+func ParseDNSQuestion(data []byte, offset int) (DNSQuestion, int, error) {
+	if offset >= len(data) {
+		return DNSQuestion{}, offset, fmt.Errorf("question offset out of bounds: %d", offset)
+	}
+
+	nameStart := offset
+	for {
+		if offset >= len(data) {
+			return DNSQuestion{}, offset, fmt.Errorf("unterminated DNS name")
+		}
+
+		labelLen := int(data[offset])
+		offset++
+
+		if labelLen == 0 {
+			break
+		}
+
+		if offset+labelLen > len(data) {
+			return DNSQuestion{}, offset, fmt.Errorf("label exceeds packet length")
+		}
+		offset += labelLen
+	}
+
+	if offset+4 > len(data) {
+		return DNSQuestion{}, offset, fmt.Errorf("question missing type/class")
+	}
+
+	q := DNSQuestion{
+		Name:  append([]byte(nil), data[nameStart:offset]...),
+		Type:  binary.BigEndian.Uint16(data[offset : offset+2]),
+		Class: binary.BigEndian.Uint16(data[offset+2 : offset+4]),
+	}
+
+	return q, offset + 4, nil
+}
+
 func (q *DNSQuestion) Marshal() []byte {
 	buf := make([]byte, 0, len(q.Name)+4)
 	buf = append(buf, q.Name...)
@@ -158,16 +195,15 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 		return fmt.Errorf("parsing DNS header: %w", err)
 	}
 
-	question := DNSQuestion{
-		Name:  []byte{0x0c, 'c', 'o', 'd', 'e', 'c', 'r', 'a', 'f', 't', 'e', 'r', 's', 0x02, 'i', 'o', 0x00},
-		Type:  1,
-		Class: 1,
+	question, _, err := ParseDNSQuestion(data, 12)
+	if err != nil {
+		return fmt.Errorf("parsing DNS question: %w", err)
 	}
 
 	answer := DNSAnswer{
-		Name:     []byte{0x0c, 'c', 'o', 'd', 'e', 'c', 'r', 'a', 'f', 't', 'e', 'r', 's', 0x02, 'i', 'o', 0x00},
-		Type:     1,
-		Class:    1,
+		Name:     question.Name,
+		Type:     question.Type,
+		Class:    question.Class,
 		TTL:      60,
 		RDLength: 4,
 		RData:    []byte{8, 8, 8, 8},
