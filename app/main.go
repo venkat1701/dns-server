@@ -80,41 +80,93 @@ func ParseDNSHeader(data []byte) (DNSHeader, error) {
 	}, nil
 }
 
+func ParseDNSName(data []byte, offset int) ([]byte, int, error) {
+	if offset >= len(data) {
+		return nil, offset, fmt.Errorf("name offset out of bounds: %d", offset)
+	}
+
+	name := make([]byte, 0, 64)
+	nextOffset := offset
+	jumped := false
+	visited := map[int]bool{}
+
+	for {
+		if offset >= len(data) {
+			return nil, nextOffset, fmt.Errorf("unterminated DNS name")
+		}
+
+		length := data[offset]
+
+		if length&0xC0 == 0xC0 {
+			if offset+1 >= len(data) {
+				return nil, nextOffset, fmt.Errorf("truncated compressed DNS pointer")
+			}
+
+			pointer := int(length&0x3F)<<8 | int(data[offset+1])
+			if pointer >= len(data) {
+				return nil, nextOffset, fmt.Errorf("compressed DNS pointer out of bounds")
+			}
+
+			if visited[pointer] {
+				return nil, nextOffset, fmt.Errorf("compressed DNS pointer loop detected")
+			}
+			visited[pointer] = true
+
+			if !jumped {
+				nextOffset = offset + 2
+				jumped = true
+			}
+
+			offset = pointer
+			continue
+		}
+
+		if length&0xC0 != 0 {
+			return nil, nextOffset, fmt.Errorf("invalid DNS label length byte: %d", length)
+		}
+
+		offset++
+		if length == 0 {
+			name = append(name, 0x00)
+			if !jumped {
+				nextOffset = offset
+			}
+			break
+		}
+
+		if offset+int(length) > len(data) {
+			return nil, nextOffset, fmt.Errorf("label exceeds packet length")
+		}
+
+		name = append(name, length)
+		name = append(name, data[offset:offset+int(length)]...)
+		offset += int(length)
+	}
+
+	return name, nextOffset, nil
+}
+
 func ParseDNSQuestion(data []byte, offset int) (DNSQuestion, int, error) {
 	if offset >= len(data) {
 		return DNSQuestion{}, offset, fmt.Errorf("question offset out of bounds: %d", offset)
 	}
 
-	nameStart := offset
-	for {
-		if offset >= len(data) {
-			return DNSQuestion{}, offset, fmt.Errorf("unterminated DNS name")
-		}
-
-		labelLen := int(data[offset])
-		offset++
-
-		if labelLen == 0 {
-			break
-		}
-
-		if offset+labelLen > len(data) {
-			return DNSQuestion{}, offset, fmt.Errorf("label exceeds packet length")
-		}
-		offset += labelLen
+	name, nextOffset, err := ParseDNSName(data, offset)
+	if err != nil {
+		return DNSQuestion{}, offset, err
 	}
 
-	if offset+4 > len(data) {
-		return DNSQuestion{}, offset, fmt.Errorf("question missing type/class")
+	if nextOffset+4 > len(data) {
+		return DNSQuestion{}, nextOffset, fmt.Errorf("question missing type/class")
 	}
 
 	q := DNSQuestion{
-		Name:  append([]byte(nil), data[nameStart:offset]...),
-		Type:  binary.BigEndian.Uint16(data[offset : offset+2]),
-		Class: binary.BigEndian.Uint16(data[offset+2 : offset+4]),
+		Name:  name,
+		Type:  binary.BigEndian.Uint16(data[nextOffset : nextOffset+2]),
+		Class: binary.BigEndian.Uint16(data[nextOffset+2 : nextOffset+4]),
 	}
 
-	return q, offset + 4, nil
+	return q, nextOffset + 4, nil
 }
 
 func (q *DNSQuestion) Marshal() []byte {
@@ -195,18 +247,15 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 		return fmt.Errorf("parsing DNS header: %w", err)
 	}
 
-	question, _, err := ParseDNSQuestion(data, 12)
-	if err != nil {
-		return fmt.Errorf("parsing DNS question: %w", err)
-	}
-
-	answer := DNSAnswer{
-		Name:     question.Name,
-		Type:     question.Type,
-		Class:    question.Class,
-		TTL:      60,
-		RDLength: 4,
-		RData:    []byte{8, 8, 8, 8},
+	questions := make([]DNSQuestion, 0, header.QDCount)
+	offset := 12
+	for i := 0; i < int(header.QDCount); i++ {
+		question, nextOffset, parseErr := ParseDNSQuestion(data, offset)
+		if parseErr != nil {
+			return fmt.Errorf("parsing DNS question %d: %w", i+1, parseErr)
+		}
+		questions = append(questions, question)
+		offset = nextOffset
 	}
 
 	rcode := byte(0)
@@ -224,17 +273,38 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 		RA:      0, // Recursion not available
 		Z:       0,
 		RCODE:   rcode,
-		QDCount: 1,
+		QDCount: uint16(len(questions)),
 		ANCount: 0,
 		NSCount: 0,
 		ARCount: 0,
 	}
 
-	response := append(respHeader.Marshal(), question.Marshal()...)
+	response := respHeader.Marshal()
+	for _, question := range questions {
+		response = append(response, question.Marshal()...)
+	}
+
 	if rcode == 0 {
-		respHeader.ANCount = 1
-		response = append(respHeader.Marshal(), question.Marshal()...)
-		response = append(response, answer.Marshal()...)
+		answers := make([]DNSAnswer, 0, len(questions))
+		for _, question := range questions {
+			answers = append(answers, DNSAnswer{
+				Name:     question.Name,
+				Type:     question.Type,
+				Class:    question.Class,
+				TTL:      60,
+				RDLength: 4,
+				RData:    []byte{8, 8, 8, 8},
+			})
+		}
+
+		respHeader.ANCount = uint16(len(answers))
+		response = respHeader.Marshal()
+		for _, question := range questions {
+			response = append(response, question.Marshal()...)
+		}
+		for _, answer := range answers {
+			response = append(response, answer.Marshal()...)
+		}
 	}
 
 	_, err = s.conn.WriteToUDP(response, source)
