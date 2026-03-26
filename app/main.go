@@ -30,6 +30,15 @@ type DNSQuestion struct {
 	Class uint16
 }
 
+type DNSAnswer struct {
+	Name     []byte
+	Type     uint16
+	Class    uint16
+	TTL      uint32
+	RDLength uint16
+	RData    []byte
+}
+
 // Marshal packs the header into 12 bytes (BigEndian per RFC1035
 // Byte layout of the flags word(bytes 2-3):
 // 0                   1                   2                   3
@@ -79,6 +88,27 @@ func (q *DNSQuestion) Marshal() []byte {
 	buf = append(buf, tmp...)
 	binary.BigEndian.PutUint16(tmp, q.Class)
 	buf = append(buf, tmp...)
+	return buf
+}
+
+func (a *DNSAnswer) Marshal() []byte {
+	buf := make([]byte, 0, len(a.Name)+10+len(a.RData))
+	buf = append(buf, a.Name...)
+
+	tmp2 := make([]byte, 2)
+	binary.BigEndian.PutUint16(tmp2, a.Type)
+	buf = append(buf, tmp2...)
+	binary.BigEndian.PutUint16(tmp2, a.Class)
+	buf = append(buf, tmp2...)
+
+	tmp4 := make([]byte, 4)
+	binary.BigEndian.PutUint32(tmp4, a.TTL)
+	buf = append(buf, tmp4...)
+
+	binary.BigEndian.PutUint16(tmp2, a.RDLength)
+	buf = append(buf, tmp2...)
+	buf = append(buf, a.RData...)
+
 	return buf
 }
 
@@ -134,6 +164,15 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 		Class: 1,
 	}
 
+	answer := DNSAnswer{
+		Name:     []byte{0x0c, 'c', 'o', 'd', 'e', 'c', 'r', 'a', 'f', 't', 'e', 'r', 's', 0x02, 'i', 'o', 0x00},
+		Type:     1,
+		Class:    1,
+		TTL:      60,
+		RDLength: 4,
+		RData:    []byte{8, 8, 8, 8},
+	}
+
 	rcode := byte(0)
 	if header.OPCODE != 0 {
 		rcode = 4
@@ -156,6 +195,11 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 	}
 
 	response := append(respHeader.Marshal(), question.Marshal()...)
+	if rcode == 0 {
+		respHeader.ANCount = 1
+		response = append(respHeader.Marshal(), question.Marshal()...)
+		response = append(response, answer.Marshal()...)
+	}
 
 	_, err = s.conn.WriteToUDP(response, source)
 	if err != nil {
