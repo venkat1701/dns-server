@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"net"
+	"time"
 )
 
 // Structs for DNS Header
@@ -169,6 +171,128 @@ func ParseDNSQuestion(data []byte, offset int) (DNSQuestion, int, error) {
 	return q, nextOffset + 4, nil
 }
 
+func ParseDNSAnswer(data []byte, offset int) (DNSAnswer, int, error) {
+	name, nextOffset, err := ParseDNSName(data, offset)
+	if err != nil {
+		return DNSAnswer{}, offset, err
+	}
+
+	if nextOffset+10 > len(data) {
+		return DNSAnswer{}, nextOffset, fmt.Errorf("answer missing fixed fields")
+	}
+
+	rdLength := binary.BigEndian.Uint16(data[nextOffset+8 : nextOffset+10])
+	rDataStart := nextOffset + 10
+	rDataEnd := rDataStart + int(rdLength)
+	if rDataEnd > len(data) {
+		return DNSAnswer{}, nextOffset, fmt.Errorf("answer rdata exceeds packet length")
+	}
+
+	answer := DNSAnswer{
+		Name:     name,
+		Type:     binary.BigEndian.Uint16(data[nextOffset : nextOffset+2]),
+		Class:    binary.BigEndian.Uint16(data[nextOffset+2 : nextOffset+4]),
+		TTL:      binary.BigEndian.Uint32(data[nextOffset+4 : nextOffset+8]),
+		RDLength: rdLength,
+		RData:    append([]byte(nil), data[rDataStart:rDataEnd]...),
+	}
+
+	return answer, rDataEnd, nil
+}
+
+func parseQuestionsAndAnswers(data []byte, header DNSHeader) ([]DNSQuestion, []DNSAnswer, error) {
+	offset := 12
+	questions := make([]DNSQuestion, 0, header.QDCount)
+	for i := 0; i < int(header.QDCount); i++ {
+		question, nextOffset, err := ParseDNSQuestion(data, offset)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parsing DNS question %d: %w", i+1, err)
+		}
+		questions = append(questions, question)
+		offset = nextOffset
+	}
+
+	answers := make([]DNSAnswer, 0, header.ANCount)
+	for i := 0; i < int(header.ANCount); i++ {
+		answer, nextOffset, err := ParseDNSAnswer(data, offset)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parsing DNS answer %d: %w", i+1, err)
+		}
+		answers = append(answers, answer)
+		offset = nextOffset
+	}
+
+	return questions, answers, nil
+}
+
+func buildQueryPacket(requestHeader DNSHeader, question DNSQuestion) []byte {
+	queryHeader := DNSHeader{
+		ID:      requestHeader.ID,
+		QR:      0,
+		OPCODE:  requestHeader.OPCODE,
+		AA:      0,
+		TC:      0,
+		RD:      requestHeader.RD,
+		RA:      0,
+		Z:       0,
+		RCODE:   0,
+		QDCount: 1,
+		ANCount: 0,
+		NSCount: 0,
+		ARCount: 0,
+	}
+
+	packet := queryHeader.Marshal()
+	packet = append(packet, question.Marshal()...)
+	return packet
+}
+
+func (s *UDPServer) forwardAnswers(requestHeader DNSHeader, questions []DNSQuestion) ([]DNSAnswer, error) {
+	resolverAddr, err := net.ResolveUDPAddr("udp", s.resolverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("resolving resolver address: %w", err)
+	}
+
+	conn, err := net.DialUDP("udp", nil, resolverAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dialing resolver: %w", err)
+	}
+	defer conn.Close()
+
+	allAnswers := make([]DNSAnswer, 0, len(questions))
+	buf := make([]byte, 512)
+
+	for i, question := range questions {
+		queryPacket := buildQueryPacket(requestHeader, question)
+		if _, err := conn.Write(queryPacket); err != nil {
+			return nil, fmt.Errorf("forwarding question %d: %w", i+1, err)
+		}
+
+		if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			return nil, fmt.Errorf("setting resolver read deadline: %w", err)
+		}
+
+		n, err := conn.Read(buf)
+		if err != nil {
+			return nil, fmt.Errorf("reading resolver response for question %d: %w", i+1, err)
+		}
+
+		respHeader, err := ParseDNSHeader(buf[:n])
+		if err != nil {
+			return nil, fmt.Errorf("parsing resolver header for question %d: %w", i+1, err)
+		}
+
+		_, answers, err := parseQuestionsAndAnswers(buf[:n], respHeader)
+		if err != nil {
+			return nil, fmt.Errorf("parsing resolver body for question %d: %w", i+1, err)
+		}
+
+		allAnswers = append(allAnswers, answers...)
+	}
+
+	return allAnswers, nil
+}
+
 func (q *DNSQuestion) Marshal() []byte {
 	buf := make([]byte, 0, len(q.Name)+4)
 	buf = append(buf, q.Name...)
@@ -202,12 +326,13 @@ func (a *DNSAnswer) Marshal() []byte {
 }
 
 type UDPServer struct {
-	addr string
-	conn *net.UDPConn
+	addr         string
+	resolverAddr string
+	conn         *net.UDPConn
 }
 
-func NewUDPServer(addr string) *UDPServer {
-	return &UDPServer{addr: addr}
+func NewUDPServer(addr, resolverAddr string) *UDPServer {
+	return &UDPServer{addr: addr, resolverAddr: resolverAddr}
 }
 
 func (s *UDPServer) Start() error {
@@ -247,15 +372,9 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 		return fmt.Errorf("parsing DNS header: %w", err)
 	}
 
-	questions := make([]DNSQuestion, 0, header.QDCount)
-	offset := 12
-	for i := 0; i < int(header.QDCount); i++ {
-		question, nextOffset, parseErr := ParseDNSQuestion(data, offset)
-		if parseErr != nil {
-			return fmt.Errorf("parsing DNS question %d: %w", i+1, parseErr)
-		}
-		questions = append(questions, question)
-		offset = nextOffset
+	questions, _, err := parseQuestionsAndAnswers(data, header)
+	if err != nil {
+		return fmt.Errorf("parsing DNS packet body: %w", err)
 	}
 
 	rcode := byte(0)
@@ -286,15 +405,22 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 
 	if rcode == 0 {
 		answers := make([]DNSAnswer, 0, len(questions))
-		for _, question := range questions {
-			answers = append(answers, DNSAnswer{
-				Name:     question.Name,
-				Type:     question.Type,
-				Class:    question.Class,
-				TTL:      60,
-				RDLength: 4,
-				RData:    []byte{8, 8, 8, 8},
-			})
+		if s.resolverAddr != "" {
+			answers, err = s.forwardAnswers(header, questions)
+			if err != nil {
+				return err
+			}
+		} else {
+			for _, question := range questions {
+				answers = append(answers, DNSAnswer{
+					Name:     question.Name,
+					Type:     question.Type,
+					Class:    question.Class,
+					TTL:      60,
+					RDLength: 4,
+					RData:    []byte{8, 8, 8, 8},
+				})
+			}
 		}
 
 		respHeader.ANCount = uint16(len(answers))
@@ -321,7 +447,10 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 var _ = net.ListenUDP
 
 func main() {
-	server := NewUDPServer("127.0.0.1:2053")
+	resolverAddr := flag.String("resolver", "", "upstream DNS resolver address in ip:port form")
+	flag.Parse()
+
+	server := NewUDPServer("127.0.0.1:2053", *resolverAddr)
 	if err := server.Start(); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
