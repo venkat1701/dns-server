@@ -24,6 +24,12 @@ type DNSHeader struct {
 	ARCount uint16 // 16 bits - Additional Record Count
 }
 
+type DNSQuestion struct {
+	Name  []byte
+	Type  uint16
+	Class uint16
+}
+
 // Marshal packs the header into 12 bytes (BigEndian per RFC1035
 // Byte layout of the flags word(bytes 2-3):
 // 0                   1                   2                   3
@@ -47,7 +53,7 @@ func ParseDNSHeader(data []byte) (DNSHeader, error) {
 		return DNSHeader{}, fmt.Errorf("buffer too short: need 12 bytes, got %d", len(data))
 	}
 
-	flags := binary.BigEndian.Uint16(data[0:2])
+	flags := binary.BigEndian.Uint16(data[2:4])
 	return DNSHeader{
 		ID:      binary.BigEndian.Uint16(data[0:2]),
 		QR:      byte((flags >> 15) & 0x1),
@@ -63,6 +69,17 @@ func ParseDNSHeader(data []byte) (DNSHeader, error) {
 		NSCount: binary.BigEndian.Uint16(data[8:10]),
 		ARCount: binary.BigEndian.Uint16(data[10:12]),
 	}, nil
+}
+
+func (q *DNSQuestion) Marshal() []byte {
+	buf := make([]byte, 0, len(q.Name)+4)
+	buf = append(buf, q.Name...)
+	tmp := make([]byte, 2)
+	binary.BigEndian.PutUint16(tmp, q.Type)
+	buf = append(buf, tmp...)
+	binary.BigEndian.PutUint16(tmp, q.Class)
+	buf = append(buf, tmp...)
+	return buf
 }
 
 type UDPServer struct {
@@ -111,8 +128,19 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 		return fmt.Errorf("parsing DNS header: %w", err)
 	}
 
+	question := DNSQuestion{
+		Name:  []byte{0x0c, 'c', 'o', 'd', 'e', 'c', 'r', 'a', 'f', 't', 'e', 'r', 's', 0x02, 'i', 'o', 0x00},
+		Type:  1,
+		Class: 1,
+	}
+
+	rcode := byte(0)
+	if header.OPCODE != 0 {
+		rcode = 4
+	}
+
 	respHeader := DNSHeader{
-		ID:      header.ID,
+		ID:      1234,
 		QR:      1, // Response
 		OPCODE:  header.OPCODE,
 		AA:      0, // Authoritative Answer
@@ -120,14 +148,16 @@ func (s *UDPServer) handleQuery(data []byte, source *net.UDPAddr) error {
 		RD:      header.RD,
 		RA:      0, // Recursion not available
 		Z:       0,
-		RCODE:   0, // No error
-		QDCount: header.QDCount,
+		RCODE:   rcode,
+		QDCount: 1,
 		ANCount: 0,
 		NSCount: 0,
 		ARCount: 0,
 	}
 
-	_, err = s.conn.WriteToUDP(respHeader.Marshal(), source)
+	response := append(respHeader.Marshal(), question.Marshal()...)
+
+	_, err = s.conn.WriteToUDP(response, source)
 	if err != nil {
 		return fmt.Errorf("sending response: %w", err)
 	}
